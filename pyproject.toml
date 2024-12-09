@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools >= 61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "grox"
+version = "0.0.1"
+requires-python = ">= 3.12"
+description = "Score-based diffusion in jax"
+authors = [
+  {name = "Omer Rochman", email = "o.rochman@uliege.be"},
+]
+classifiers = [
+  "Intended Audience :: Science/Research",
+  "License :: OSI Approved :: MIT License",
+  "Natural Language :: English",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+]
+license = {file = "LICENSE"}
+readme = "README.md"
+dynamic = ["dependencies"]
+
+[project.urls]
+documentation = "https://github.com/OmerRochman/grox"
+
+[tool.setuptools.dynamic]
+dependencies = {file = "requirements.txt"}
+
+[tool.setuptools.packages.find]
+include = ["grox"]

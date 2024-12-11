@@ -48,7 +48,7 @@ class ProbODE:
         return 0.0
 
 
-class NoiseODE:
+class EmdODE:
     def __init__(
         self, denoiser: Callable, scale_schedule: Callable, sigma_schedule: Callable
     ):

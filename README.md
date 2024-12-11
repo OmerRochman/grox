@@ -28,6 +28,12 @@ Grox is a Python package for score-based diffusion modelling in Jax. It is inten
    pip install -e .
    ```
 
+   or to install jax with gpu support:
+
+   ```bash
+   pip install -e .[cuda]
+   ```
+
    This installs the module in editable mode, allowing you to make changes to the code and have them reflected without reinstalling.
 
 ## Additional Notes

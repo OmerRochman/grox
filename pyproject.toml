@@ -24,6 +24,9 @@ dynamic = ["dependencies"]
 [project.urls]
 documentation = "https://github.com/OmerRochman/grox"
 
+[project.optional-dependencies]
+cuda = ["jax[cuda12]"]
+
 [tool.setuptools.dynamic]
 dependencies = {file = "requirements.txt"}
 

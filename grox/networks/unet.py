@@ -1,10 +1,16 @@
 from typing import Callable, List
 
+from jax.image import resize
 import jax.lax as lax
 import jax.numpy as jnp
 from einops import rearrange
 from flax import linen as nn
 from jax import Array
+
+
+def small_init(key, shape, dtype=jnp.float32):
+    default_kernel_init = nn.initializers.lecun_normal()
+    return default_kernel_init(key, shape, dtype) * 0.01
 
 
 class Modulation(nn.Module):
@@ -17,13 +23,12 @@ class Modulation(nn.Module):
         spatial_dims: Number of spatial dimensions. Default: 2.
     """
 
-    time_embed_features: int
     input_features: int
     output_features: int
     spatial_dims: int = 2
 
     def setup(self):
-        self.linear1 = nn.Dense(self.time_embed_features)
+        self.linear1 = nn.Dense(2 * self.input_features + self.output_features)
         self.linear2 = nn.Dense(2 * self.input_features + self.output_features)
         self.activation = nn.swish
 
@@ -51,22 +56,22 @@ class SineEncoding(nn.Module):
     r"""Sine encoding for temporal features
 
     Args:
-        features: Number of features to encode.
+        n_freqs: Number of frequencies to encode.
         omega: Frequency of the sine encoding.
         time_embed_features: Number of features in the time embedding.
         act: Activation function.
     """
 
-    features: int
+    n_freqs: int
     omega: float = 1e4
     time_embed_features: int = 64
     act: Callable = nn.swish
 
     def setup(self):
-        assert self.features % 2 == 0, "Features must be even."
-        freqs = jnp.linspace(0, 1, self.features // 2, dtype=jnp.float32)
-        freqs = self.omega ** (-freqs)
-        self.freqs = freqs
+        assert self.n_freqs % 2 == 0, "Features must be even."
+        freqs = jnp.linspace(0, 1, self.n_freqs // 2, dtype=jnp.float32)
+        self.freqs = self.omega ** (-freqs)
+        self.freqs = self.freqs[None, :]
         self.linear1 = nn.Dense(self.time_embed_features)
         self.linear2 = nn.Dense(self.time_embed_features)
 
@@ -90,13 +95,11 @@ class MLP(nn.Module):
     r"""Simple MLP
 
     Args:
-        num_inputs: Number of input features.
         num_outputs: Number of output features.
         architecture: List of hidden layer sizes.
         activation: Activation function
     """
 
-    num_inputs: int
     num_outputs: int
     architecture: List[int]
     activation: Callable = nn.swish
@@ -114,7 +117,7 @@ class MLP(nn.Module):
 
 
 class ResBlock(nn.Module):
-    r"""Residual block with modulation
+    r"""Residual block with modulation, and the capacity to change the hidden dimension.
 
     Args:
         in_features: Number of input features.
@@ -122,7 +125,6 @@ class ResBlock(nn.Module):
         kernel_size: Kernel size.
         strides: Strides.
         act: Activation function.
-        emb_features: Number of features in the time embedding.
         dropout_rate: Dropout rate. TODO: Implement dropout.
         padding: Padding type, "SAME" or "CIRCULAR".
 
@@ -133,7 +135,6 @@ class ResBlock(nn.Module):
     kernel_size: tuple = (3, 3)
     strides: tuple = (1, 1)
     act: Callable = nn.swish
-    emb_features: int = 64
     dropout_rate: float = 0.0
     padding: str = "SAME"
 
@@ -151,76 +152,104 @@ class ResBlock(nn.Module):
             strides=self.strides,
             padding=self.padding,
         )
-        self.modulation = Modulation(
-            self.emb_features, self.in_features, self.out_features
-        )
+        self.modulation = Modulation(self.in_features, self.out_features)
         self.norm = nn.LayerNorm()
 
-    def __call__(self, x: Array, t: Array):
+    def __call__(self, x: Array, t: Array, train: bool = True) -> Array:
         a, b, c = self.modulation(t)
-        y = self.norm(x)
         y = (a + 1) * x + b
+        y = self.norm(y)
+
         y = self.conv1(y)
         y = self.act(y)
-        # y = self.dropout(y)
+        # y = self.dropout(y, deterministic=False)
         y = self.conv2(y)
-        y = x + c * y
+        if x.shape[-1] == y.shape[-1]:
+            y = x + c * y
+        else:
+            y = y * c
+
         return y * lax.rsqrt(1 + c**2)
 
 
-class UNet2D(nn.Module):
+class Resize(nn.Module):
+    def setup(self):
+        self.norm = nn.LayerNorm()
+
+    def __call__(
+        self, x: Array, shape: tuple, method: str = "linear", antialias: bool = True
+    ) -> Array:
+        x = self.norm(x)
+        return resize(image=x, shape=shape, method=method, antialias=antialias)
+
+
+class UNet(nn.Module):
     r"""2D U-Net with time modulation and sine encoding.
 
     Args:
-        architecture: List of hidden layer sizes.
-        in_channels: Number of input channels.
         out_channels: Number of output channels.
+        blocks_per_layer: Number of ResBlocks per layer.
+        hidden_channels_per_layer: Number of hidden channels in each layer.
         kernel_size: Kernel size.
         activation: Activation function.
         dropout_rate: Dropout rate.
         emb_features: Number of features in the time embedding.
+        n_freqs: Number of frequencies in the time embedding.
         padding: Padding type, "SAME" or "CIRCULAR". Circular padding is used for periodic boundary conditions in 1D problems, where H is time and W is space.
     """
 
-    architecture: List[int]
-    in_channels: int
     out_channels: int
+    blocks_per_layer: tuple = (2, 2)
+    hidden_channels_per_layer: tuple = (64, 64)
     kernel_size: tuple = (3, 3)
     activation: Callable = nn.swish
     dropout_rate: float = 0.0
     emb_features: int = 64
+    n_freqs: int = 64
     padding: str = "SAME"
+    omega: float = 1e4
+    mlp_hiddden_channels: tuple = (64, 64, 64)
 
     def setup(self):
+        assert len(self.blocks_per_layer) == len(self.hidden_channels_per_layer)
+
         self.time_embedding = SineEncoding(
-            features=64, time_embed_features=self.emb_features
+            n_freqs=64, time_embed_features=self.emb_features, omega=self.omega
         )
         self.encoder = MLP(
-            self.in_channels, self.architecture[0], [64, 64, 64], self.activation
+            self.hidden_channels_per_layer[0],
+            self.mlp_hiddden_channels,
+            self.activation,
         )
         self.decoder = MLP(
-            self.architecture[0], self.out_channels, [64, 64, 64], self.activation
+            self.out_channels,
+            self.mlp_hiddden_channels,
+            self.activation,
         )
 
         down_blocks = []
-        for i in range(len(self.architecture) - 1):
-            down_blocks.append(
-                ResBlock(
-                    self.architecture[i],
-                    self.architecture[i],
-                    kernel_size=self.kernel_size,
-                    act=self.activation,
-                    emb_features=self.emb_features,
-                    dropout_rate=self.dropout_rate,
-                    padding=self.padding,
+        up_blocks = []
+        prev_channels = self.hidden_channels_per_layer[0]
+        for num_blocks, channels in zip(
+            self.blocks_per_layer, self.hidden_channels_per_layer
+        ):
+            for i in range(num_blocks):
+                down_blocks.append(
+                    ResBlock(
+                        channels if i > 0 else prev_channels,
+                        channels,
+                        kernel_size=self.kernel_size,
+                        act=self.activation,
+                        dropout_rate=self.dropout_rate,
+                        padding=self.padding,
+                    )
                 )
-            )
             down_blocks.append(
                 nn.Sequential(
                     [
                         nn.LayerNorm(),
                         nn.Conv(
-                            self.architecture[i + 1],
+                            channels,
                             self.kernel_size,
                             strides=(2, 2),
                             padding=self.padding,
@@ -228,38 +257,40 @@ class UNet2D(nn.Module):
                     ]
                 )
             )
-        self.down_blocks = down_blocks
-
-        up_blocks = []
-        for i in range(len(self.architecture) - 2, -1, -1):
-            up_blocks.append(
-                ResBlock(
-                    self.architecture[i + 1],
-                    self.architecture[i + 1],
-                    kernel_size=self.kernel_size,
-                    act=self.activation,
-                    emb_features=self.emb_features,
-                    dropout_rate=self.dropout_rate,
-                    padding=self.padding,
+            for i in range(num_blocks):
+                up_blocks.append(
+                    ResBlock(
+                        channels,
+                        channels,
+                        kernel_size=self.kernel_size,
+                        act=self.activation,
+                        dropout_rate=self.dropout_rate,
+                        padding=self.padding,
+                    )
                 )
-            )
+
             up_blocks.append(
                 nn.Sequential(
                     [
                         nn.LayerNorm(),
                         nn.ConvTranspose(
-                            self.architecture[i],
+                            channels,
                             self.kernel_size,
                             strides=(2, 2),
                             padding=self.padding,
+                            kernel_init=small_init,
                         ),
+                        # Resize(),
                     ]
                 )
             )
+            prev_channels = channels
+
+        self.down_blocks = down_blocks
         self.up_blocks = up_blocks
 
         self.bottleneck = nn.Conv(
-            self.architecture[-1],
+            self.hidden_channels_per_layer[-1],
             self.kernel_size,
             strides=(1, 1),
             padding=self.padding,
@@ -277,26 +308,27 @@ class UNet2D(nn.Module):
             k = self.kernel_size[0] - 1
             zeros = jnp.zeros_like(x[..., :k, :, :])
             x = jnp.concatenate([zeros, x, zeros], axis=-3)
+
         t = self.time_embedding(t)
 
-        skip_connections = [x]
+        skip_connections = []
         for down_block in self.down_blocks:
             if isinstance(down_block, ResBlock):
                 x = down_block(x, t)
             else:
-                x = down_block(x)
                 skip_connections.append(x)
+                x = down_block(x)
 
         x = self.bottleneck(x)
         x = self.activation(x)
 
-        skip = skip_connections.pop(-1)
-        for up_block in self.up_blocks:
+        for up_block in self.up_blocks[::-1]:
             if isinstance(up_block, ResBlock):
-                x = up_block(x, t) + skip
-                skip = skip_connections.pop(-1)
+                x = up_block(x, t)
             else:
-                x = up_block(x)
+                skip = skip_connections.pop(-1)
+                # shape = skip.shape
+                x = up_block(x) + skip
 
         if self.padding == "CIRCULAR":
             x = x[..., k:-k, :, :]
